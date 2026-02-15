@@ -1,0 +1,22 @@
+{
+  "name": "ai-rj-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "clean": "node ./scripts-clean.mjs",
+    "dev": "npm run clean && next dev -p 3001",
+    "build": "npm run clean && next build",
+    "start": "npm run build && next start -p 3001"
+  },
+  "dependencies": {
+    "next": "15.1.6",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "typescript": "5.7.3",
+    "@types/node": "22.13.4",
+    "@types/react": "19.0.8",
+    "@types/react-dom": "19.0.3"
+  }
+}
