@@ -28,6 +28,5 @@ export const appConfig = {
   targetBufferSec: Number(process.env.TARGET_BUFFER_SEC || 600),
   minBufferSec: Number(process.env.MIN_BUFFER_SEC || 180),
   timelineEngineV2: process.env.TIMELINE_ENGINE_V2 === "true",
-  masterWindowSec: Number(process.env.MASTER_WINDOW_SEC || 24),
-  audioEngineV2: process.env.AUDIO_ENGINE_V2 !== "false"
+  masterWindowSec: Number(process.env.MASTER_WINDOW_SEC || 24)
 };

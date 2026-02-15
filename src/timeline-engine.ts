@@ -28,9 +28,6 @@ function adaptiveCurve(item: QueueItem): TimelineTransition["curve"] {
 
 export function buildTimelineSnapshot(snapshot: DashboardSnapshot): TimelineSnapshot {
   const queue = snapshot.queue;
-  const timelineNowSec = snapshot.streamStartedAt
-    ? Math.max(0, Math.floor((Date.now() - new Date(snapshot.streamStartedAt).getTime()) / 1000))
-    : 0;
 
   const arbitration: QueueArbitrationDecision[] = queue.map((q, idx) => ({
     segmentId: q.id,
@@ -79,10 +76,7 @@ export function buildTimelineSnapshot(snapshot: DashboardSnapshot): TimelineSnap
     const q = queue[i];
     const isVoice = q.type === "commentary";
     const deck = isVoice ? "VO" : currentDeck;
-    const explicitStart = typeof q.scheduledStartSec === "number"
-      ? Math.max(0, q.scheduledStartSec - timelineNowSec)
-      : null;
-    const startSec = explicitStart ?? (isVoice ? Math.max(0, lookaheadOffset - 6) : lookaheadOffset);
+    const startSec = isVoice ? Math.max(0, lookaheadOffset - 6) : lookaheadOffset;
 
     const clip: TimelineClip = {
       segmentId: q.id,
@@ -97,7 +91,7 @@ export function buildTimelineSnapshot(snapshot: DashboardSnapshot): TimelineSnap
       voiceoverOverlays.push(clip);
     } else {
       activeDeckClips.push(clip);
-      lookaheadOffset = Math.max(lookaheadOffset, startSec + q.durationSec);
+      lookaheadOffset += q.durationSec;
       const nxt = queue[i + 1];
       if (nxt && nxt.type !== "commentary") {
         const windowSec = adaptiveTransitionWindow(q);

@@ -159,7 +159,7 @@ Show Context:
 - Genre vibe to amplify: ${genreContext}
 
 Your task:
-Create a short, high-energy radio segment (20-30 seconds spoken length) in a rhythmic, lightly rhyming jingle style.
+Create a short, high-energy radio segment (40-60 seconds spoken length) in a rhythmic, lightly rhyming jingle style.
 
 Content Requirements:
 1. Reference at least one previously played song for continuity.
@@ -186,7 +186,7 @@ Return only the spoken script, No formatting. No stage directions.
         body: JSON.stringify({
           model: this.model,
           temperature: 1.5,
-          max_tokens: 1200,
+          max_tokens: 2000,
           messages: [{role: "system", content: system },{ role: "user", content: prompt }]
         })
       }

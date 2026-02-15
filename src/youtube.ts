@@ -6,7 +6,7 @@ import type { Track } from "./types";
 export class YouTubeAudioService {
   private readonly cacheDir: string;
   private downloaderArgs: string[] | null = null;
-  private readonly clipSeconds = 60;
+  private readonly clipSeconds = 120;
 
   constructor(workDir: string) {
     this.cacheDir = path.join(workDir, "yt-cache");

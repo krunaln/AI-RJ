@@ -1,39 +1,46 @@
 "use client";
 
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { applyEvent, initialUiState, type UiState } from "../lib/state";
-import type { AudioChannel, DashboardEvent, DashboardSnapshot, TimelineSnapshot } from "../lib/types";
-import { EventFeed } from "../components/event-feed";
-import { fmtSeconds, inferChannel, stripLabel } from "../components/channel-utils";
-import { MixerSection, type ChannelView } from "../components/mixer-section";
-import { QueueSection } from "../components/queue-section";
+import type { DashboardEvent, DashboardSnapshot, QueueItem, TimelineSnapshot } from "../lib/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_RJ_API_BASE || "http://127.0.0.1:3000";
-const MONITOR_HLS_URL = process.env.NEXT_PUBLIC_MONITOR_HLS_URL || "http://127.0.0.1:8888/live/radio/index.m3u8";
 
 type ConnectionState = "connecting" | "connected" | "disconnected";
-type WsPayload =
-  | { type: "snapshot"; revision: number; snapshot: DashboardSnapshot }
-  | { type: "event"; revision: number; event: DashboardEvent };
 
-const CHANNEL_ORDER: Array<{ id: AudioChannel; label: string }> = [
-  { id: "music", label: "Music" },
-  { id: "voice", label: "Voice" },
-  { id: "jingle", label: "Jingle" },
-  { id: "ads", label: "Ads" }
-];
-
-function toWsBase(apiBase: string): string {
-  const url = new URL(apiBase);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.pathname = "/ws";
-  url.search = "";
-  return url.toString();
+function fmtSeconds(sec: number): string {
+  if (!Number.isFinite(sec)) return "0:00";
+  const s = Math.max(0, Math.floor(sec));
+  const min = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${min}:${String(rem).padStart(2, "0")}`;
 }
 
 function MediaPlayer({ filePath }: { filePath: string }) {
   const src = `${API_BASE}/dashboard/media-by-path?path=${encodeURIComponent(filePath)}`;
   return <audio controls preload="none" src={src} />;
+}
+
+function QueueControls({ item, onRemove, onPatch }: { item: QueueItem; onRemove: (id: string) => void; onPatch: (id: string, patch: { priority?: number; pinned?: boolean }) => void }) {
+  return (
+    <div className="queueCtl mono">
+      <label>
+        Priority {item.priority}
+        <input
+          type="range"
+          min={0}
+          max={200}
+          value={item.priority}
+          onChange={(e) => onPatch(item.id, { priority: Number(e.target.value) })}
+        />
+      </label>
+      <label className="pinRow">
+        <input type="checkbox" checked={item.pinned} onChange={(e) => onPatch(item.id, { pinned: e.target.checked })} />
+        Pinned
+      </label>
+      <button onClick={() => onRemove(item.id)}>Remove</button>
+    </div>
+  );
 }
 
 export default function Page() {
@@ -46,13 +53,8 @@ export default function Page() {
   const [trackTitle, setTrackTitle] = useState("");
   const [trackArtist, setTrackArtist] = useState("");
   const [trackUrl, setTrackUrl] = useState("");
-
+  const [tick, setTick] = useState(0);
   const lastMessageAt = useRef<number>(Date.now());
-  const lastRevision = useRef<number>(0);
-  const pendingSnapshot = useRef<DashboardSnapshot | null>(null);
-  const pendingEvents = useRef<DashboardEvent[]>([]);
-  const flushTimer = useRef<number | null>(null);
-  const lastTimelineFetchMs = useRef<number>(0);
 
   useEffect(() => {
     const loadSnapshot = async () => {
@@ -65,108 +67,67 @@ export default function Page() {
       const t = (await res.json()) as TimelineSnapshot;
       setTimeline(t);
     };
-    loadSnapshot().catch(() => setConnection("disconnected"));
-    loadTimeline().catch(() => undefined);
+    loadSnapshot().catch(() => {
+      setConnection("disconnected");
+    });
+    loadTimeline().catch(() => {
+      // ignore
+    });
   }, []);
 
   useEffect(() => {
-    const poll = setInterval(() => {
-      fetch(`${API_BASE}/dashboard/snapshot`)
-        .then((r) => r.json())
-        .then((snapshot: DashboardSnapshot) => setUi((prev) => ({ ...prev, snapshot })))
-        .catch(() => undefined);
-
-      if (connection !== "connected") {
-        fetch(`${API_BASE}/timeline/snapshot`)
-          .then((r) => r.json())
-          .then((t: TimelineSnapshot) => setTimeline(t))
-          .catch(() => undefined);
-      }
-    }, connection === "connected" ? 900 : 1500);
-
-    return () => clearInterval(poll);
-  }, [connection]);
+    const t = setInterval(() => setTick((v) => v + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
 
   useEffect(() => {
     let stopped = false;
     let retryMs = 1000;
-    let ws: WebSocket | null = null;
-
-    const flushPending = () => {
-      flushTimer.current = null;
-      const nextSnapshot = pendingSnapshot.current;
-      const eventsBatch = pendingEvents.current.splice(0, pendingEvents.current.length);
-      pendingSnapshot.current = null;
-      setUi((prev) => {
-        let out: UiState = nextSnapshot ? { ...prev, snapshot: nextSnapshot } : prev;
-        for (const e of eventsBatch) {
-          out = applyEvent(out, e);
-        }
-        return out;
-      });
-    };
-
-    const scheduleFlush = () => {
-      if (flushTimer.current !== null) return;
-      flushTimer.current = window.setTimeout(flushPending, 90);
-    };
+    let es: EventSource | null = null;
 
     const connect = () => {
       if (stopped) return;
       setConnection("connecting");
-      const wsUrl = `${toWsBase(API_BASE)}?lastRevision=${encodeURIComponent(String(lastRevision.current))}`;
-      ws = new WebSocket(wsUrl);
+      es = new EventSource(`${API_BASE}/dashboard/events`);
 
-      ws.onopen = () => {
+      es.onopen = () => {
         retryMs = 1000;
         setConnection("connected");
         lastMessageAt.current = Date.now();
       };
 
-      ws.onmessage = (evt) => {
+      es.addEventListener("message", (m) => {
+        const evt = m as MessageEvent;
         try {
-          const parsed = JSON.parse(String(evt.data)) as WsPayload;
+          const parsed = JSON.parse(evt.data) as DashboardEvent;
           lastMessageAt.current = Date.now();
-
-          if (parsed.type === "snapshot") {
-            lastRevision.current = parsed.revision;
-            pendingSnapshot.current = parsed.snapshot;
-            scheduleFlush();
-            return;
-          }
-
-          lastRevision.current = parsed.revision;
-          pendingEvents.current.push(parsed.event);
-          scheduleFlush();
-
+          setUi((prev) => applyEvent(prev, parsed));
           if (
-            parsed.event.event === "timeline.updated" ||
-            parsed.event.event === "queue.arbitrated" ||
-            parsed.event.event === "segment.enqueued" ||
-            parsed.event.event === "segment.started" ||
-            parsed.event.event === "segment.finished"
+            parsed.event === "timeline.updated" ||
+            parsed.event === "queue.arbitrated" ||
+            parsed.event === "segment.enqueued" ||
+            parsed.event === "segment.started" ||
+            parsed.event === "segment.finished"
           ) {
-            const now = Date.now();
-            if (now - lastTimelineFetchMs.current > 500) {
-              lastTimelineFetchMs.current = now;
-              fetch(`${API_BASE}/timeline/snapshot`)
-                .then((r) => r.json())
-                .then((t: TimelineSnapshot) => setTimeline(t))
-                .catch(() => undefined);
-            }
+            fetch(`${API_BASE}/timeline/snapshot`)
+              .then((r) => r.json())
+              .then((t: TimelineSnapshot) => setTimeline(t))
+              .catch(() => {
+                // ignore
+              });
           }
         } catch {
           // ignore malformed event
         }
-      };
+      });
 
-      ws.onerror = () => {
-        setConnection("disconnected");
-        ws?.close();
-      };
+      es.addEventListener("heartbeat", () => {
+        lastMessageAt.current = Date.now();
+      });
 
-      ws.onclose = () => {
+      es.onerror = () => {
         setConnection("disconnected");
+        es?.close();
         if (stopped) return;
         setTimeout(connect, retryMs);
         retryMs = Math.min(10000, retryMs * 2);
@@ -182,54 +143,26 @@ export default function Page() {
     return () => {
       stopped = true;
       clearInterval(watcher);
-      if (flushTimer.current !== null) {
-        window.clearTimeout(flushTimer.current);
-      }
-      ws?.close();
+      es?.close();
     };
   }, []);
 
   const snapshot = ui.snapshot;
-  const queue = useMemo(() => snapshot?.queue.slice(0, 20) ?? [], [snapshot?.queue]);
-  const recentSegments = useMemo(() => snapshot?.recentSegments.slice(0, 20) ?? [], [snapshot?.recentSegments]);
-  const events = useMemo(() => ui.liveEvents.slice(0, 40), [ui.liveEvents]);
-  const deferredEvents = useDeferredValue(events);
+  const queue = snapshot?.queue.slice(0, 20) ?? [];
+  const recentSegments = snapshot?.recentSegments.slice(0, 20) ?? [];
+  const events = ui.liveEvents.slice(0, 40);
+  const deckBPlanned = timeline?.activeDeckClips.find((c) => c.deck === "B") || null;
+  const voiceoverPlanned = timeline?.voiceoverOverlays[0] || null;
 
-  const hlsUrl = useMemo(() => MONITOR_HLS_URL, []);
+  const hlsUrl = useMemo(() => "http://127.0.0.1:8888/live/radio/index.m3u8", []);
   const streamUptimeSec = snapshot?.streamStartedAt ? Math.max(0, Math.floor((Date.now() - new Date(snapshot.streamStartedAt).getTime()) / 1000)) : 0;
   const playheadElapsedSec = snapshot?.nowPlaying ? Math.max(0, Math.floor((Date.now() - new Date(snapshot.nowPlaying.startedAt).getTime()) / 1000)) : 0;
   const playheadDurationSec = snapshot?.nowPlaying?.durationSec ?? 0;
   const playheadRemainingSec = Math.max(0, Math.floor(playheadDurationSec - playheadElapsedSec));
   const playheadPct = playheadDurationSec > 0 ? Math.max(0, Math.min(100, (playheadElapsedSec / playheadDurationSec) * 100)) : 0;
-  const mainMeter = Math.round(Math.max(0, Math.min(1, snapshot?.meters.master ?? 0)) * 100);
+  const vu = Math.min(100, Math.round((snapshot?.bufferedSec ?? 0) / 6));
 
-  const channelViews = useMemo<ChannelView[]>(() => {
-    const byChannel = new Map<AudioChannel, typeof queue>();
-    for (const c of CHANNEL_ORDER) byChannel.set(c.id, []);
-    for (const q of queue) {
-      const ch = inferChannel(q);
-      const list = byChannel.get(ch);
-      if (list) list.push(q);
-    }
-
-    const now = snapshot?.nowPlaying;
-
-    return CHANNEL_ORDER.map((c) => {
-      const queued = byChannel.get(c.id) ?? [];
-      const active = now && inferChannel(now) === c.id ? now : null;
-      const head = active ?? queued[0] ?? null;
-      const meterPct = Math.round(Math.max(0, Math.min(1, snapshot?.meters[c.id] ?? 0)) * 100);
-      return {
-        channel: c.id,
-        label: c.label,
-        active: head,
-        queued,
-        meterPct
-      };
-    });
-  }, [queue, snapshot?.nowPlaying, snapshot?.meters]);
-
-  const runControl = useCallback(async (action: "start" | "stop") => {
+  const runControl = async (action: "start" | "stop") => {
     if (!window.confirm(`Confirm ${action} stream?`)) return;
     setActionBusy(true);
     try {
@@ -237,13 +170,13 @@ export default function Page() {
     } finally {
       setActionBusy(false);
     }
-  }, []);
+  };
 
-  const skipNow = useCallback(async () => {
+  const skipNow = async () => {
     await fetch(`${API_BASE}/dashboard/transport/skip`, { method: "POST" });
-  }, []);
+  };
 
-  const addCommentary = useCallback(async () => {
+  const addCommentary = async () => {
     const text = commentaryText.trim();
     if (!text) return;
     await fetch(`${API_BASE}/dashboard/queue/commentary`, {
@@ -252,9 +185,9 @@ export default function Page() {
       body: JSON.stringify({ text })
     });
     setCommentaryText("");
-  }, [commentaryText]);
+  };
 
-  const addTrack = useCallback(async () => {
+  const addTrack = async () => {
     const title = trackTitle.trim();
     const youtube_url = trackUrl.trim();
     if (!title || !youtube_url) return;
@@ -266,26 +199,26 @@ export default function Page() {
     setTrackTitle("");
     setTrackArtist("");
     setTrackUrl("");
-  }, [trackTitle, trackArtist, trackUrl]);
+  };
 
-  const removeQueued = useCallback(async (segmentId: string) => {
+  const removeQueued = async (segmentId: string) => {
     await fetch(`${API_BASE}/dashboard/queue/${segmentId}`, { method: "DELETE" });
-  }, []);
+  };
 
-  const patchQueued = useCallback(async (segmentId: string, patch: { priority?: number; pinned?: boolean }) => {
+  const patchQueued = async (segmentId: string, patch: { priority?: number; pinned?: boolean }) => {
     await fetch(`${API_BASE}/dashboard/queue/${segmentId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch)
     });
-  }, []);
+  };
 
   return (
-    <main className="djShell mixerShell">
+    <main className="djShell">
       <header className="djHeader">
         <div>
-          <h1>PULSE AI BROADCAST CONSOLE</h1>
-          <p>Channel mixer view for scheduled playout</p>
+          <h1>PULSEAI LIVE</h1>
+          <p>Live autonomous DJ control room</p>
         </div>
         <div className="statusWrap">
           <span className={`pill ${snapshot?.running ? "ok" : "bad"}`}>{snapshot?.running ? "ON AIR" : "OFF AIR"}</span>
@@ -298,34 +231,73 @@ export default function Page() {
 
       {disconnectedLong ? <div className="banner">SSE disconnected for more than 15 seconds.</div> : null}
 
-      <MixerSection
-        snapshot={snapshot}
-        streamUptimeSec={streamUptimeSec}
-        channelViews={channelViews}
-        mainMeter={mainMeter}
-        playheadElapsedSec={playheadElapsedSec}
-        playheadRemainingSec={playheadRemainingSec}
-        playheadDurationSec={playheadDurationSec}
-      />
+      <section className="deckGrid">
+        <article className="panel deckA">
+          <h2>Deck A / Now Playing</h2>
+          {snapshot?.nowPlaying ? (
+            <>
+              <p className="mono">{snapshot.nowPlaying.type.toUpperCase()} | {snapshot.nowPlaying.id}</p>
+              <p>{snapshot.nowPlaying.type === "commentary" ? (snapshot.nowPlaying.commentaryText ?? snapshot.nowPlaying.notes) : snapshot.nowPlaying.notes}</p>
+              <div className="timeRow mono">
+                <span>{fmtSeconds(playheadElapsedSec)}</span>
+                <span>{fmtSeconds(playheadRemainingSec)}</span>
+                <span>{fmtSeconds(playheadDurationSec)}</span>
+              </div>
+              <div className="progressTrack"><div className="progressFill" style={{ width: `${playheadPct}%` }} /></div>
+              <MediaPlayer filePath={snapshot.nowPlaying.filePath} />
+            </>
+          ) : <p>No active segment.</p>}
+        </article>
 
-      <section className="panel">
-        <h2>Now Playing</h2>
-        {snapshot?.nowPlaying ? (
-          <>
-            <p className="mono">{snapshot.nowPlaying.type.toUpperCase()} | {snapshot.nowPlaying.id} | {(snapshot.nowPlaying.channel || inferChannel(snapshot.nowPlaying)).toUpperCase()}</p>
-            <p>{stripLabel(snapshot.nowPlaying)}</p>
-            <div className="timeRow mono">
-              <span>{fmtSeconds(playheadElapsedSec)}</span>
-              <span>{fmtSeconds(playheadRemainingSec)}</span>
-              <span>{fmtSeconds(playheadDurationSec)}</span>
-            </div>
-            <div className="progressTrack"><div className="progressFill" style={{ width: `${playheadPct}%` }} /></div>
-            <MediaPlayer filePath={snapshot.nowPlaying.filePath} />
-          </>
-        ) : <p>No active segment.</p>}
+        <article className="panel mixer">
+          <h2>Mixer</h2>
+          <div className="mono">Uptime: {fmtSeconds(streamUptimeSec)}</div>
+          <div className="mono">Buffered: {fmtSeconds(snapshot?.bufferedSec ?? 0)}</div>
+          <div className="mono">Lookahead: {fmtSeconds(snapshot?.lookaheadSecCovered ?? 0)}</div>
+          <div className="mono">Phase: {snapshot?.phase ?? "-"}</div>
+          <div className="mono">Tracks: {snapshot?.tracksLoaded ?? 0}</div>
+          <div className="mono">Crossfader: {snapshot?.crossfader.active ? `${snapshot.crossfader.fromDeck} -> ${snapshot.crossfader.toDeck} (${snapshot.crossfader.curve})` : "idle"}</div>
+          <div className="mono">Ducking: {snapshot?.ducking.active ? `ON (-${snapshot.ducking.reductionDb}dB)` : "OFF"}</div>
+          <div className="vuTrack"><div className="vuFill" style={{ width: `${vu}%` }} /></div>
+          <p className="mono">Errors: {snapshot?.lastError ?? "none"}</p>
+        </article>
       </section>
 
-      <QueueSection queue={queue} apiBase={API_BASE} onRemove={removeQueued} onPatch={patchQueued} />
+      <section className="deckGrid">
+        <article className="panel">
+          <h2>Deck B</h2>
+          <p className="mono">Active: {snapshot?.deckB.activeSegmentId ?? "none"}</p>
+          <p className="mono">Planned: {deckBPlanned?.segmentId ?? "none"}</p>
+          <p className="mono">Type: {deckBPlanned?.type ?? snapshot?.deckB.activeType ?? "-"}</p>
+          <p className="mono">Start@T+{fmtSeconds(deckBPlanned?.startSec ?? 0)} | Dur: {fmtSeconds(deckBPlanned?.durationSec ?? 0)}</p>
+        </article>
+        <article className="panel">
+          <h2>Voiceover Lane</h2>
+          <p className="mono">Active: {snapshot?.voiceoverLane.active ? "yes" : "no"}</p>
+          <p className="mono">Planned: {voiceoverPlanned?.segmentId ?? "none"}</p>
+          <p className="mono">Type: {voiceoverPlanned?.type ?? "-"}</p>
+          <p className="mono">Start@T+{fmtSeconds(voiceoverPlanned?.startSec ?? 0)} | Dur: {fmtSeconds(voiceoverPlanned?.durationSec ?? 0)}</p>
+          <p className="mono">Master Timeline: {fmtSeconds(snapshot?.masterPlayhead.timelineOffsetSec ?? 0)}</p>
+        </article>
+      </section>
+
+      <section className="panel">
+        <h2>DJ Queue (priority + pin)</h2>
+        <div className="list mono">
+          {queue.map((q) => (
+            <div key={q.id} className="queueRow">
+              <div>
+                <div>{q.type.toUpperCase()} | {fmtSeconds(q.durationSec)} | {q.source}</div>
+                <div className="mono">{q.pinned ? "manual_pinned" : q.source === "manual" ? "manual_priority" : "auto_priority"}</div>
+                <div>{q.type === "commentary" ? (q.commentaryText ?? q.notes) : q.notes}</div>
+                <MediaPlayer filePath={q.filePath} />
+              </div>
+              <QueueControls item={q} onRemove={removeQueued} onPatch={patchQueued} />
+            </div>
+          ))}
+          {!queue.length ? <p>Queue empty.</p> : null}
+        </div>
+      </section>
 
       <section className="deckGrid">
         <article className="panel">
@@ -345,7 +317,18 @@ export default function Page() {
           </div>
         </article>
 
-        <EventFeed events={deferredEvents} hlsUrl={hlsUrl} />
+        <article className="panel">
+          <h2>Event Feed</h2>
+          <div className="list mono">
+            {events.map((e, idx) => (
+              <div key={`${e.ts}-${idx}`} className={`eventRow ${e.event.includes("failed") || e.event.includes("error") ? "danger" : ""}`}>
+                <span>{new Date(e.ts).toLocaleTimeString()}</span>
+                <span>{e.event}</span>
+              </div>
+            ))}
+          </div>
+          <p className="mono"><a href={hlsUrl} target="_blank">Open HLS Stream</a></p>
+        </article>
       </section>
 
       <section className="panel">
@@ -354,15 +337,10 @@ export default function Page() {
           {recentSegments.map((s) => (
             <div key={`${s.id}-${s.startedAt}`} className="eventRow">
               <span>{s.type}</span>
-              <span>{(s.channel || inferChannel(s)).toUpperCase()} | {s.type === "commentary" ? (s.commentaryText ?? s.notes) : s.notes}</span>
+              <span>{s.type === "commentary" ? (s.commentaryText ?? s.notes) : s.notes}</span>
             </div>
           ))}
         </div>
-      </section>
-
-      <section className="panel">
-        <h2>Timeline Monitor</h2>
-        <p className="mono">Transitions: {timeline?.nextTransitions.length ?? 0} | Deck Clips: {timeline?.activeDeckClips.length ?? 0} | VO Overlays: {timeline?.voiceoverOverlays.length ?? 0}</p>
       </section>
     </main>
   );

@@ -30,8 +30,7 @@ function baseSnapshot(): DashboardSnapshot {
     voiceoverLane: { active: false, segmentId: null, positionSec: 0, remainingSec: 0 },
     crossfader: { active: false, fromDeck: null, toDeck: null, position: 0, curve: "tri", windowSec: 0, transitionStartTs: null },
     ducking: { active: false, reductionDb: 0 },
-    lookaheadSecCovered: 0,
-    meters: { music: 0, voice: 0, jingle: 0, ads: 0, master: 0 }
+    lookaheadSecCovered: 0
   };
 }
 

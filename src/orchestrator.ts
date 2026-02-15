@@ -1,18 +1,18 @@
 import { access, mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 import { appConfig } from "./config";
-import type { AudioChannel, RenderedSegment, Track } from "./types";
+import type { RenderedSegment, Track } from "./types";
 import { loadCatalog } from "./catalog";
 import { YouTubeAudioService } from "./youtube";
 import { CommentaryService } from "./llm";
 import { TTSClient } from "./tts";
 import { RtmpPublisher } from "./publisher";
-import { applyEdgeFades, enhanceCommentaryVoice, getDurationSec, makeOutFile, prependStationId, silenceFile } from "./audio";
+import { applyEdgeFades, enhanceCommentaryVoice, getDurationSec, makeOutFile, mixCommentaryWithTrackBed, prependStationId, silenceFile, trimAudioStart } from "./audio";
 import { log, logError } from "./log";
 import { RuntimeState } from "./runtime-state";
 import { buildTimelineSnapshot } from "./timeline-engine";
 import type { TimelineSnapshot } from "./types";
-import { AudioEngine } from "./audio-engine";
+import { renderMasterWindowForAnchor, type PendingSegment } from "./master-window";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,26 +27,17 @@ export class Orchestrator {
   private lastPlayed: Track[] = [];
   private lastError = "";
   private songsSinceCommentary = 0;
+  private carryOverTrackId: string | null = null;
+  private carryOverOffsetSec = 0;
+  private forcedNextTrackId: string | null = null;
   private readonly runtime = new RuntimeState();
+  private pendingMasterSegments: PendingSegment[] = [];
   private stationIdAvailable = false;
-  private stationIdDurationSec = 0;
-  private scheduleCursorSec = 0;
-  private lastScheduledSegment: { type: RenderedSegment["type"]; startAtSec: number; durationSec: number } | null = null;
-  private lastMeterPushMs = 0;
 
   private readonly yt = new YouTubeAudioService(appConfig.workDir);
   private readonly commentary = new CommentaryService(appConfig.groqApiKey, appConfig.groqModel, appConfig.persona);
   private readonly tts = new TTSClient(appConfig.ttsBaseUrl);
-  private readonly useAudioEngine = appConfig.audioEngineV2;
   private readonly publisher = new RtmpPublisher(appConfig.workDir, appConfig.rtmpUrl, {
-    onStarted: (rtmpUrl) => this.runtime.publisherStarted(rtmpUrl),
-    onStopped: () => this.runtime.publisherStopped(),
-    onError: (message, code) => this.runtime.publisherError(message, code),
-    onFfmpegLine: (line) => this.runtime.publisherLine(line),
-    onSegmentStarted: (segmentId) => this.runtime.segmentStarted(segmentId),
-    onSegmentFinished: (segmentId, bufferedSec) => this.runtime.segmentFinished(segmentId, bufferedSec)
-  });
-  private readonly audioEngine = new AudioEngine(appConfig.workDir, appConfig.rtmpUrl, {
     onStarted: (rtmpUrl) => this.runtime.publisherStarted(rtmpUrl),
     onStopped: () => this.runtime.publisherStopped(),
     onError: (message, code) => this.runtime.publisherError(message, code),
@@ -63,12 +54,24 @@ export class Orchestrator {
     await this.yt.init();
     const raw = makeOutFile(appConfig.workDir, "manual-talk-raw");
     const voiced = makeOutFile(appConfig.workDir, "manual-talk");
+    const next = this.peekNextTrack();
 
     await this.tts.synthToFile(text, raw);
-    await enhanceCommentaryVoice(raw, voiced);
+    const voiceDuration = await getDurationSec(raw);
+
+    if (next) {
+      try {
+        const bed = await this.yt.fetchTrackWav(next);
+        await mixCommentaryWithTrackBed(raw, bed, voiced, voiceDuration);
+      } catch {
+        await enhanceCommentaryVoice(raw, voiced);
+      }
+    } else {
+      await enhanceCommentaryVoice(raw, voiced);
+    }
 
     let finalCommentary = voiced;
-    if (this.stationIdAvailable && !this.useAudioEngine) {
+    if (this.stationIdAvailable) {
       const withId = makeOutFile(appConfig.workDir, "manual-talk-id");
       await prependStationId(appConfig.stationIdPath, voiced, withId);
       finalCommentary = withId;
@@ -86,8 +89,8 @@ export class Orchestrator {
       priority: 120,
       pinned: true
     };
-
-    await this.enqueueSegmentForOutput(seg);
+    this.publisher.enqueue(seg);
+    this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
     return seg;
   }
 
@@ -116,32 +119,26 @@ export class Orchestrator {
       priority: 110,
       pinned: true
     };
-
-    await this.enqueueSegmentForOutput(seg);
+    this.publisher.enqueue(seg);
+    this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
     return seg;
   }
 
   removeQueuedSegment(segmentId: string): boolean {
-    const removed = this.useAudioEngine
-      ? this.audioEngine.removeClip(segmentId)
-      : this.publisher.removeQueuedSegment(segmentId);
+    const removed = this.publisher.removeQueuedSegment(segmentId);
     if (!removed) {
       return false;
     }
-    this.runtime.removeQueuedSegment(segmentId, this.getPlannedBufferedSec());
+    this.runtime.removeQueuedSegment(segmentId, this.publisher.getBufferedSec());
     return true;
   }
 
   updateQueuedSegment(segmentId: string, patch: { priority?: number; pinned?: boolean }): boolean {
-    const updated = this.useAudioEngine
-      ? Boolean(this.runtime.updateQueuedSegment(segmentId, patch, this.getPlannedBufferedSec()))
-      : this.publisher.updateQueuedSegment(segmentId, patch);
+    const updated = this.publisher.updateQueuedSegment(segmentId, patch);
     if (!updated) {
       return false;
     }
-    if (!this.useAudioEngine) {
-      this.runtime.updateQueuedSegment(segmentId, patch, this.publisher.getBufferedSec());
-    }
+    this.runtime.updateQueuedSegment(segmentId, patch, this.publisher.getBufferedSec());
     return true;
   }
 
@@ -164,9 +161,6 @@ export class Orchestrator {
 
   skipCurrentSegment(): boolean {
     this.runtime.markSkipRequested();
-    if (this.useAudioEngine) {
-      return false;
-    }
     const ok = this.publisher.skipCurrentSegment();
     if (ok) {
       this.runtime.markSkipCompleted();
@@ -184,34 +178,18 @@ export class Orchestrator {
     this.tracks = await loadCatalog(appConfig.catalogPath);
     this.resetShuffleOrder();
     this.stationIdAvailable = await this.checkStationId();
-    this.stationIdDurationSec = this.stationIdAvailable ? await this.safeStationIdDuration() : 0;
     await this.yt.init();
-    this.scheduleCursorSec = 0;
-    this.lastScheduledSegment = null;
-
-    if (this.useAudioEngine) {
-      await this.audioEngine.start();
-      this.scheduleCursorSec = this.audioEngine.nowSec();
-    } else {
-      await this.publisher.start();
-    }
+    await this.publisher.start();
 
     this.running = true;
     this.songsSinceCommentary = 0;
-    this.lastMeterPushMs = 0;
+    this.pendingMasterSegments = [];
     this.runtime.setCore({
       running: true,
       phase: this.phase,
       tracksLoaded: this.tracks.length,
-      bufferedSec: this.getPlannedBufferedSec(),
+      bufferedSec: this.publisher.getBufferedSec(),
       lastError: null
-    });
-    this.runtime.setMeters(this.useAudioEngine ? this.audioEngine.getMeters() : {
-      music: 0,
-      voice: 0,
-      jingle: 0,
-      ads: 0,
-      master: 0
     });
     this.loop().catch((err) => {
       this.lastError = String(err instanceof Error ? err.message : err);
@@ -220,24 +198,13 @@ export class Orchestrator {
       this.runtime.markBuildFailed(this.lastError);
       this.runtime.setCore({ running: false, lastError: this.lastError });
     });
-    log("orchestrator.started", { tracks: this.tracks.length, mode: this.useAudioEngine ? "audio-engine" : "publisher" });
+    log("orchestrator.started", { tracks: this.tracks.length });
   }
 
   async stop(): Promise<void> {
     this.running = false;
-    if (this.useAudioEngine) {
-      await this.audioEngine.stop();
-    } else {
-      await this.publisher.stop();
-    }
-    this.runtime.setMeters({
-      music: 0,
-      voice: 0,
-      jingle: 0,
-      ads: 0,
-      master: 0
-    });
-    this.runtime.setCore({ running: false, bufferedSec: this.getPlannedBufferedSec() });
+    await this.publisher.stop();
+    this.runtime.setCore({ running: false, bufferedSec: this.publisher.getBufferedSec() });
     log("orchestrator.stopped");
   }
 
@@ -248,125 +215,37 @@ export class Orchestrator {
 
   private async loop(): Promise<void> {
     while (this.running) {
-      if (this.useAudioEngine) {
-        this.audioEngine.syncLifecycle();
-        this.maybePublishMeters();
-        this.audioEngine.renderAndPushUntil(4).catch((error) => {
-          const msg = error instanceof Error ? error.message : String(error);
-          this.lastError = msg;
-          this.runtime.setCore({ lastError: msg });
-          this.runtime.markBuildFailed(msg);
-          logError("audioengine.render.loop", error);
-        });
-      }
-
-      let bufferedSec = this.getPlannedBufferedSec();
+      const bufferedSec = this.publisher.getBufferedSec();
       this.runtime.setCore({ bufferedSec, phase: this.phase });
-
-      let builds = 0;
-      const maxBuildsPerTick = this.useAudioEngine ? 4 : 1;
-      while (bufferedSec < appConfig.targetBufferSec && builds < maxBuildsPerTick) {
+      if (bufferedSec < appConfig.targetBufferSec) {
         try {
           this.runtime.markBuildStarted(this.phase);
           const seg = await this.buildNextSegment();
-          await this.enqueueSegmentForOutput(seg);
+          if (appConfig.timelineEngineV2) {
+            this.pendingMasterSegments.push({ segment: seg, consumedSec: 0 });
+            this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
+            await this.flushMasterWindows();
+          } else {
+            this.publisher.enqueue(seg);
+            this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
+          }
           log("segment.enqueued", {
             segmentId: seg.id,
             type: seg.type,
             durationSec: seg.durationSec,
-            bufferedSec: this.getPlannedBufferedSec(),
+            bufferedSec: this.publisher.getBufferedSec(),
             notes: seg.notes
           });
-          builds += 1;
-          bufferedSec = this.getPlannedBufferedSec();
-          this.runtime.setCore({ bufferedSec, phase: this.phase });
         } catch (error) {
           this.lastError = String(error instanceof Error ? error.message : error);
           logError("segment.build.error", error);
           this.runtime.markBuildFailed(this.lastError);
           this.runtime.setCore({ lastError: this.lastError });
           await this.enqueueEmergencySilence();
-          break;
         }
       }
       await wait(250);
     }
-  }
-
-  private maybePublishMeters(): void {
-    const nowMs = Date.now();
-    if (nowMs - this.lastMeterPushMs < 300) {
-      return;
-    }
-    this.lastMeterPushMs = nowMs;
-    this.runtime.setMeters(this.audioEngine.getMeters());
-  }
-
-  private async enqueueSegmentForOutput(seg: RenderedSegment): Promise<void> {
-    if (!this.useAudioEngine) {
-      this.publisher.enqueue(seg);
-      this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
-      return;
-    }
-
-    const channel = this.mapSegmentChannel(seg.type);
-    const baseStartSec = Math.max(this.scheduleCursorSec, this.audioEngine.nowSec());
-    let startAtSec = baseStartSec;
-
-    if (seg.type === "songs" && this.lastScheduledSegment?.type === "commentary") {
-      const overlapStart = this.lastScheduledSegment.startAtSec + (this.lastScheduledSegment.durationSec * 0.5);
-      startAtSec = Math.max(this.audioEngine.nowSec(), Math.min(baseStartSec, overlapStart));
-    }
-
-    if (seg.type === "commentary" && this.stationIdAvailable && this.stationIdDurationSec > 0.05) {
-      const crossfadeSec = Math.min(0.45, this.stationIdDurationSec * 0.4);
-      const voiceStartSec = baseStartSec + Math.max(0, this.stationIdDurationSec - crossfadeSec);
-      this.audioEngine.addClip({
-        id: `${seg.id}::station-id`,
-        channel: "jingle",
-        filePath: appConfig.stationIdPath,
-        startAtSec: baseStartSec,
-        durationSec: this.stationIdDurationSec,
-        gain: 1,
-        gainFrom: 1,
-        gainTo: 0.15,
-        gainRampSec: Math.max(0.2, this.stationIdDurationSec)
-      });
-      startAtSec = voiceStartSec;
-    }
-
-    seg.channel = channel;
-    seg.scheduledStartSec = startAtSec;
-
-    this.audioEngine.addClip({
-      id: seg.id,
-      segmentId: seg.id,
-      channel,
-      filePath: seg.filePath,
-      startAtSec,
-      durationSec: seg.durationSec,
-      gain: channel === "voice" ? 1.35 : 1,
-      gainFrom: channel === "voice" ? 0.65 : 0.7,
-      gainTo: channel === "voice" ? 1.35 : 1,
-      gainRampSec: channel === "voice" ? 3.5 : 7
-    });
-
-    this.scheduleCursorSec = Math.max(this.scheduleCursorSec, startAtSec + seg.durationSec);
-    this.lastScheduledSegment = { type: seg.type, startAtSec, durationSec: seg.durationSec };
-    this.runtime.enqueueSegment(seg, this.getPlannedBufferedSec());
-  }
-
-  private mapSegmentChannel(type: RenderedSegment["type"]): AudioChannel {
-    if (type === "commentary") return "voice";
-    if (type === "liner") return "jingle";
-    return "music";
-  }
-
-  private getPlannedBufferedSec(): number {
-    if (!this.useAudioEngine) return this.publisher.getBufferedSec();
-    const now = this.audioEngine.nowSec();
-    const scheduled = Math.max(0, this.scheduleCursorSec - now);
-    return Math.max(scheduled, this.audioEngine.bufferedSec());
   }
 
   private nextTrack(): Track {
@@ -392,6 +271,7 @@ export class Orchestrator {
       this.shuffledTrackOrder[j] = a;
     }
 
+    // Avoid same track repeating at boundary between shuffle cycles.
     if (n > 1 && this.lastPlayed[0]) {
       const lastId = this.lastPlayed[0].id;
       const firstIdx = this.shuffledTrackOrder[0];
@@ -408,17 +288,25 @@ export class Orchestrator {
 
   private async buildNextSegment(): Promise<RenderedSegment> {
     if (this.phase === "songs") {
-      const track = this.nextTrack();
-      let out: string;
+      const track = this.consumeNextSongTrack();
+      let rawSong: string;
       try {
-        const rawSong = await this.yt.fetchTrackWav(track);
-        out = makeOutFile(appConfig.workDir, "song-faded");
-        await applyEdgeFades(rawSong, out, 0.4, 0.9);
+        rawSong = await this.yt.fetchTrackWav(track);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
         this.runtime.markYoutubeError(msg);
         throw error;
       }
+      if (this.carryOverTrackId === track.id && this.carryOverOffsetSec > 0) {
+        const trimmed = makeOutFile(appConfig.workDir, "song-carry-trim");
+        await trimAudioStart(rawSong, trimmed, this.carryOverOffsetSec);
+        rawSong = trimmed;
+        this.carryOverTrackId = null;
+        this.carryOverOffsetSec = 0;
+        this.forcedNextTrackId = null;
+      }
+      const out = makeOutFile(appConfig.workDir, "song-faded");
+      await applyEdgeFades(rawSong, out, 0.4, 0.9);
 
       const durationSec = await getDurationSec(out);
       this.lastPlayed = [track];
@@ -454,9 +342,32 @@ export class Orchestrator {
         const raw = makeOutFile(appConfig.workDir, "talk-raw");
         out = await this.tts.synthToFile(text, raw);
         const voiced = makeOutFile(appConfig.workDir, "talk-mix");
-        await enhanceCommentaryVoice(out, voiced);
+        const voiceDuration = await getDurationSec(out);
+        if (next) {
+          try {
+            const bed = await this.yt.fetchTrackWav(next);
+            await mixCommentaryWithTrackBed(out, bed, voiced, voiceDuration);
+            // Next song continues from where commentary already previewed its bed.
+            this.carryOverTrackId = next.id;
+            const bedStartSec = Math.max(0, voiceDuration * 0.5);
+            const bedTailSec = 0.9;
+            const previewedBedSec = Math.max(0, voiceDuration - bedStartSec + bedTailSec);
+            this.carryOverOffsetSec = Math.max(0, Math.min(previewedBedSec, 25));
+            this.forcedNextTrackId = next.id;
+          } catch {
+            await enhanceCommentaryVoice(out, voiced);
+            this.carryOverTrackId = null;
+            this.carryOverOffsetSec = 0;
+            this.forcedNextTrackId = null;
+          }
+        } else {
+          await enhanceCommentaryVoice(out, voiced);
+          this.carryOverTrackId = null;
+          this.carryOverOffsetSec = 0;
+          this.forcedNextTrackId = null;
+        }
         let withStationId = voiced;
-        if (this.stationIdAvailable && !this.useAudioEngine) {
+        if (this.stationIdAvailable) {
           const pre = makeOutFile(appConfig.workDir, "talk-with-id");
           await prependStationId(appConfig.stationIdPath, voiced, pre);
           withStationId = pre;
@@ -525,20 +436,44 @@ export class Orchestrator {
     return this.tracks[idx] || null;
   }
 
+  private consumeNextSongTrack(): Track {
+    if (this.forcedNextTrackId) {
+      const forced = this.tracks.find((t) => t.id === this.forcedNextTrackId);
+      if (forced) {
+        this.consumeFromShuffle(forced.id);
+        return forced;
+      }
+      this.forcedNextTrackId = null;
+    }
+    return this.nextTrack();
+  }
+
+  private consumeFromShuffle(trackId: string): void {
+    if (!this.shuffledTrackOrder.length || this.shuffledPtr >= this.shuffledTrackOrder.length) {
+      return;
+    }
+    const peekIdx = this.shuffledTrackOrder[this.shuffledPtr];
+    const peekTrack = this.tracks[peekIdx];
+    if (peekTrack?.id === trackId) {
+      this.shuffledPtr += 1;
+      return;
+    }
+    // Remove any future occurrence from the remaining order so forced track doesn't repeat soon.
+    for (let i = this.shuffledPtr; i < this.shuffledTrackOrder.length; i += 1) {
+      const idx = this.shuffledTrackOrder[i];
+      if (this.tracks[idx]?.id === trackId) {
+        this.shuffledTrackOrder.splice(i, 1);
+        return;
+      }
+    }
+  }
+
   private async checkStationId(): Promise<boolean> {
     try {
       await access(appConfig.stationIdPath);
       return true;
     } catch {
       return false;
-    }
-  }
-
-  private async safeStationIdDuration(): Promise<number> {
-    try {
-      return await getDurationSec(appConfig.stationIdPath);
-    } catch {
-      return 0;
     }
   }
 
@@ -556,6 +491,30 @@ export class Orchestrator {
       priority: 200,
       pinned: true
     };
-    await this.enqueueSegmentForOutput(seg);
+    if (appConfig.timelineEngineV2) {
+      this.pendingMasterSegments.push({ segment: seg, consumedSec: 0 });
+      this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
+      await this.flushMasterWindows();
+    } else {
+      this.publisher.enqueue(seg);
+      this.runtime.enqueueSegment(seg, this.publisher.getBufferedSec());
+    }
+  }
+
+  private async flushMasterWindows(): Promise<void> {
+    this.runtime.markSchedulerRebuild("started", "master_window_flush");
+    while (this.publisher.getBufferedSec() < appConfig.targetBufferSec && this.pendingMasterSegments.length > 0) {
+      const anchor = this.pendingMasterSegments[0];
+      const upcoming = this.pendingMasterSegments.slice(1);
+      const windowSeg = await renderMasterWindowForAnchor(
+        appConfig.workDir,
+        anchor,
+        upcoming,
+        appConfig.masterWindowSec
+      );
+      this.publisher.enqueue(windowSeg);
+      this.pendingMasterSegments.shift();
+    }
+    this.runtime.markSchedulerRebuild("done", "master_window_flush");
   }
 }
