@@ -55,6 +55,7 @@ curl http://127.0.0.1:3000/dashboard/snapshot
 
 Playback URL:
 - `http://127.0.0.1:8888/live/radio/index.m3u8`
+- Low-latency monitor (WebRTC WHEP): `http://127.0.0.1:8889/live/radio/whep`
 
 ## Dashboard (Next.js)
 1. Install dashboard deps:

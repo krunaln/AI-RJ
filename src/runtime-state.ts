@@ -1,4 +1,5 @@
 import type {
+  AudioMeterState,
   DeckId,
   DashboardEvent,
   DashboardSnapshot,
@@ -43,6 +44,16 @@ function emptyStats(): DashboardSnapshot["stats"] {
     fallbackLinerCount: 0,
     youtubeFetchErrors: 0,
     ttsFailures: 0
+  };
+}
+
+function emptyMeters(): AudioMeterState {
+  return {
+    music: 0,
+    voice: 0,
+    jingle: 0,
+    ads: 0,
+    master: 0
   };
 }
 
@@ -113,7 +124,8 @@ export class RuntimeState {
       active: false,
       reductionDb: 0
     },
-    lookaheadSecCovered: 0
+    lookaheadSecCovered: 0,
+    meters: emptyMeters()
   };
   private lastMusicDeck: DeckId = "B";
 
@@ -233,7 +245,9 @@ export class RuntimeState {
       durationSec: queueItem.durationSec,
       startedAt: new Date().toISOString(),
       filePath: queueItem.filePath,
-      commentaryText: queueItem.commentaryText
+      commentaryText: queueItem.commentaryText,
+      channel: queueItem.channel,
+      scheduledStartSec: queueItem.scheduledStartSec
     };
 
     this.snapshotState.nowPlaying = active;
@@ -403,6 +417,21 @@ export class RuntimeState {
 
   markSchedulerRebuild(stage: "started" | "done" | "failed", reason: string): void {
     this.emit(`scheduler.rebuild.${stage}`, { reason });
+  }
+
+  setMeters(next: AudioMeterState): void {
+    const cur = this.snapshotState.meters;
+    const delta =
+      Math.abs(cur.music - next.music) +
+      Math.abs(cur.voice - next.voice) +
+      Math.abs(cur.jingle - next.jingle) +
+      Math.abs(cur.ads - next.ads) +
+      Math.abs(cur.master - next.master);
+    if (delta < 0.02) {
+      return;
+    }
+    this.snapshotState.meters = next;
+    this.emit("mixer.meters", { meters: next });
   }
 
   private refreshTransportFields(): void {

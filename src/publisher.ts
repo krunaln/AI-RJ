@@ -1,10 +1,6 @@
-import { createWriteStream } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import path from "node:path";
-import { spawn } from "node:child_process";
-import { execCmd } from "./proc";
 import { log, logError } from "./log";
 import type { RenderedSegment } from "./types";
+import { RtmpSink } from "./rtmp-sink";
 
 type QueueItem = {
   segment: RenderedSegment;
@@ -25,21 +21,23 @@ function wait(ms: number): Promise<void> {
 }
 
 export class RtmpPublisher {
-  private readonly fifoPath: string;
-  private ffmpegIngest?: ReturnType<typeof spawn>;
-  private fifoWriter?: ReturnType<typeof createWriteStream>;
   private queue: QueueItem[] = [];
   private running = false;
   private processing = false;
   private bufferedSec = 0;
-  private currentTranscode?: ReturnType<typeof spawn>;
+  private readonly sink: RtmpSink;
 
   constructor(
-    private readonly workDir: string,
-    private readonly rtmpUrl: string,
+    workDir: string,
+    rtmpUrl: string,
     private readonly hooks: PublisherHooks = {}
   ) {
-    this.fifoPath = path.join(workDir, "live.pcm");
+    this.sink = new RtmpSink(workDir, rtmpUrl, {
+      onStarted: hooks.onStarted,
+      onStopped: hooks.onStopped,
+      onError: hooks.onError,
+      onFfmpegLine: hooks.onFfmpegLine
+    });
   }
 
   getBufferedSec(): number {
@@ -48,63 +46,18 @@ export class RtmpPublisher {
 
   async start(): Promise<void> {
     if (this.running) return;
-    await mkdir(this.workDir, { recursive: true });
-
-    await execCmd("rm", ["-f", this.fifoPath]);
-    await execCmd("mkfifo", [this.fifoPath]);
-
-    const ffmpegIngest = spawn("ffmpeg", [
-      "-loglevel",
-      "error",
-      "-re",
-      "-f",
-      "s16le",
-      "-ar",
-      "48000",
-      "-ac",
-      "2",
-      "-i",
-      this.fifoPath,
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
-      "-f",
-      "flv",
-      this.rtmpUrl
-    ], { stdio: ["ignore", "pipe", "pipe"] });
-
-    this.ffmpegIngest = ffmpegIngest;
-
-    ffmpegIngest.stderr?.on("data", (d) => {
-      const line = String(d).trim();
-      if (line) {
-        log("publisher.ffmpeg", { line });
-        this.hooks.onFfmpegLine?.(line);
-      }
-    });
-
-    ffmpegIngest.on("exit", (code) => {
-      logError("publisher.exit", new Error(`ffmpeg ingest exited ${code ?? -1}`));
-      this.hooks.onError?.("ffmpeg ingest exited", code ?? null);
-      this.running = false;
-    });
-
-    this.fifoWriter = createWriteStream(this.fifoPath);
+    await this.sink.start();
     this.running = true;
     this.processLoop().catch((err) => logError("publisher.loop.error", err));
-    log("publisher.started", { rtmpUrl: this.rtmpUrl });
-    this.hooks.onStarted?.(this.rtmpUrl);
+    log("publisher.started", {});
   }
 
   async stop(): Promise<void> {
     this.running = false;
     this.queue = [];
     this.bufferedSec = 0;
-    this.fifoWriter?.end();
-    this.ffmpegIngest?.kill("SIGTERM");
+    await this.sink.stop();
     log("publisher.stopped");
-    this.hooks.onStopped?.();
   }
 
   enqueue(segment: RenderedSegment): void {
@@ -155,11 +108,7 @@ export class RtmpPublisher {
   }
 
   skipCurrentSegment(): boolean {
-    if (!this.currentTranscode) {
-      return false;
-    }
-    this.currentTranscode.kill("SIGTERM");
-    return true;
+    return this.sink.abortCurrentPush();
   }
 
   private async processLoop(): Promise<void> {
@@ -175,7 +124,7 @@ export class RtmpPublisher {
 
       try {
         this.hooks.onSegmentStarted?.(next.segment.id);
-        await this.streamFile(next.segment.filePath);
+        await this.sink.pushFile(next.segment.filePath);
       } catch (error) {
         logError("publisher.stream.error", error, { filePath: next.segment.filePath });
         this.hooks.onError?.(
@@ -188,46 +137,5 @@ export class RtmpPublisher {
     }
 
     this.processing = false;
-  }
-
-  private async streamFile(filePath: string): Promise<void> {
-    if (!this.fifoWriter) {
-      throw new Error("FIFO writer is not initialized");
-    }
-
-    await new Promise<void>((resolve, reject) => {
-      const transcode = spawn("ffmpeg", [
-        "-loglevel",
-        "error",
-        "-i",
-        filePath,
-        "-f",
-        "s16le",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        "pipe:1"
-      ], { stdio: ["ignore", "pipe", "pipe"] });
-      this.currentTranscode = transcode;
-
-      transcode.stderr.on("data", (d) => {
-        const line = String(d).trim();
-        if (line) {
-          log("publisher.transcode", { line, filePath });
-        }
-      });
-
-      transcode.stdout.pipe(this.fifoWriter!, { end: false });
-      transcode.on("error", reject);
-      transcode.on("close", (code) => {
-        this.currentTranscode = undefined;
-        if (code === 0) {
-          resolve();
-          return;
-        }
-        reject(new Error(`transcode failed with ${code}`));
-      });
-    });
   }
 }

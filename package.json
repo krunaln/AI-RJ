@@ -14,8 +14,10 @@
     "dashboard:clean": "npm --prefix dashboard run clean"
   },
   "dependencies": {
+    "@types/ws": "^8.18.1",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
+    "ws": "^8.19.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

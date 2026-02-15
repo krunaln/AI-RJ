@@ -1,9 +1,12 @@
 import express from "express";
+import { createServer } from "node:http";
 import path from "node:path";
+import { WebSocketServer } from "ws";
 import { appConfig } from "./config";
 import { Orchestrator } from "./orchestrator";
 import { log, logError } from "./log";
 import { formatSseEvent, heartbeatSseEvent } from "./sse";
+import type { DashboardEvent, DashboardSnapshot } from "./types";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -21,6 +24,81 @@ app.use((_req, res, next) => {
 const orchestrator = new Orchestrator();
 const runtime = orchestrator.getRuntimeState();
 const allowedMediaRoots = [path.resolve(appConfig.workDir), path.resolve(appConfig.emergencyDir)];
+const EVENT_LOG_MAX = 2000;
+let revision = 0;
+const revisionLog: Array<{ revision: number; event: DashboardEvent }> = [];
+let lastStateUpdatedBroadcastMs = 0;
+
+const httpServer = createServer(app);
+const wsServer = new WebSocketServer({ server: httpServer, path: "/ws" });
+
+function toWsPayloadEvent(rev: number, event: DashboardEvent): string {
+  return JSON.stringify({
+    type: "event",
+    revision: rev,
+    event
+  });
+}
+
+function toWsPayloadSnapshot(rev: number, snapshot: DashboardSnapshot): string {
+  return JSON.stringify({
+    type: "snapshot",
+    revision: rev,
+    snapshot
+  });
+}
+
+function toCompactEvent(event: DashboardEvent): DashboardEvent {
+  return {
+    ts: event.ts,
+    event: event.event,
+    payload: event.payload
+  };
+}
+
+runtime.subscribe((event) => {
+  const compact = toCompactEvent(event);
+  if (compact.event === "state.updated") {
+    const now = Date.now();
+    if (now - lastStateUpdatedBroadcastMs < 500) {
+      return;
+    }
+    lastStateUpdatedBroadcastMs = now;
+  }
+  revision += 1;
+  revisionLog.push({ revision, event: compact });
+  if (revisionLog.length > EVENT_LOG_MAX) {
+    revisionLog.splice(0, revisionLog.length - EVENT_LOG_MAX);
+  }
+  const payload = toWsPayloadEvent(revision, compact);
+  for (const client of wsServer.clients) {
+    if (client.readyState === 1) {
+      client.send(payload);
+    }
+  }
+});
+
+wsServer.on("connection", (socket, req) => {
+  try {
+    const parsed = new URL(req.url || "/ws", "http://127.0.0.1");
+    const lastSeen = Number(parsed.searchParams.get("lastRevision") || "0");
+    const normalizedLastSeen = Number.isFinite(lastSeen) && lastSeen >= 0 ? Math.floor(lastSeen) : 0;
+    const neededStart = normalizedLastSeen + 1;
+    const firstAvailable = revisionLog.length ? revisionLog[0].revision : revision + 1;
+
+    if (normalizedLastSeen > 0 && neededStart >= firstAvailable) {
+      for (const item of revisionLog) {
+        if (item.revision > normalizedLastSeen) {
+          socket.send(toWsPayloadEvent(item.revision, item.event));
+        }
+      }
+    } else {
+      socket.send(toWsPayloadSnapshot(revision, runtime.snapshot()));
+    }
+  } catch {
+    socket.send(toWsPayloadSnapshot(revision, runtime.snapshot()));
+  }
+});
 
 function isAllowedMediaPath(filePath: string): boolean {
   const resolved = path.resolve(filePath);
@@ -208,7 +286,7 @@ app.post("/control/stop", async (_req, res) => {
   }
 });
 
-app.listen(appConfig.port, () => {
+httpServer.listen(appConfig.port, () => {
   log("server.listen", { port: appConfig.port });
 });
 

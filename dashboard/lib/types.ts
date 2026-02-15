@@ -1,6 +1,8 @@
 export type SegmentType = "songs" | "commentary" | "liner";
 export type QueueSource = "auto" | "manual";
 export type DeckId = "A" | "B";
+export type AudioChannel = "music" | "voice" | "jingle" | "ads";
+export type AudioMeterState = Record<AudioChannel | "master", number>;
 
 export type QueueItem = {
   id: string;
@@ -13,6 +15,8 @@ export type QueueItem = {
   source: QueueSource;
   priority: number;
   pinned: boolean;
+  channel?: AudioChannel;
+  scheduledStartSec?: number;
 };
 
 export type SegmentHistoryItem = {
@@ -24,6 +28,8 @@ export type SegmentHistoryItem = {
   finishedAt?: string;
   filePath: string;
   commentaryText?: string;
+  channel?: AudioChannel;
+  scheduledStartSec?: number;
 };
 
 export type SystemErrorItem = {
@@ -144,4 +150,5 @@ export type DashboardSnapshot = {
     reductionDb: number;
   };
   lookaheadSecCovered: number;
+  meters: AudioMeterState;
 };
